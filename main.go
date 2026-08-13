@@ -213,8 +213,8 @@ func sendV2rayLinks(token string, chatID int64, raw string) {
 	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("🔗 Found %d link(s):\n\n", len(links)))
-	for i, l := range links {
-		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, l))
+	for _, l := range links {
+		b.WriteString(l + "\n")
 	}
 	sendCode(botToken(token), chatID, b.String())
 }
