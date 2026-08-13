@@ -46,8 +46,8 @@ type tgCallbackQuery struct {
 
 // pendingDoc holds the last decrypted payload per chat so the inline format
 // buttons can format it on tap without re-downloading the file.
-// ponytail: in-memory map; single Vercel instance is fine. Use a shared
-// store (Redis) if you scale to multiple instances.
+// ponytail: in-memory map, single Vercel instance is fine. Use a shared
+// store (Redis) if you scale to multiple instances or need cross-restart persistence.
 var (
 	pendingMu sync.Mutex
 	pending   = map[int64]string{}
@@ -55,6 +55,9 @@ var (
 
 // linkRe matches v2ray-family URIs already emitted by the decoders.
 var linkRe = regexp.MustCompile(`(?:vless|vmess|trojan|ss)://\S+`)
+
+// brandFooter is the watermark shown on outputs and help.
+const brandFooter = "🔓 Decrypted by @LimooDecryptorbot"
 
 func main() {
 	port := os.Getenv("PORT")
@@ -71,6 +74,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	// One-shot webhook registration: GET /?setup=1 (or set WEBHOOK_URL).
 	if r.Method == http.MethodGet && r.URL.Query().Get("setup") != "" {
+		if botToken == "" {
+			http.Error(w, "BOT_TOKEN is not set; cannot register webhook.", http.StatusBadRequest)
+			return
+		}
 		webhookURL := os.Getenv("WEBHOOK_URL")
 		if webhookURL == "" {
 			webhookURL = "https://" + r.Host + r.URL.Path
@@ -127,6 +134,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			default:
 				sendRaw(botToken, chatID, raw)
 			}
+		} else {
+			sendPlain(botToken, chatID,
+				"⏳ Session expired — please resend the config file to get fresh options.\n\n"+brandFooter, nil)
 		}
 		answerCallback(botToken, cq.ID)
 		w.WriteHeader(http.StatusOK)
@@ -144,7 +154,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		doc := upd.Message.Document
 		raw, procErr := processDocument(botToken, doc.FileID, doc.FileName)
 		if procErr != nil {
-			sendMessage(botToken, chatID, "Failed to decrypt: "+procErr.Error(), nil)
+			sendPlain(botToken, chatID, friendlyError(procErr)+"\n\n"+brandFooter, nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -160,14 +170,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(upd.Message.Text) != "" {
 		text := strings.TrimSpace(upd.Message.Text)
 		if text == "/start" || text == "/help" {
-			sendMessage(botToken, chatID, helpText(), nil)
+			sendMarkdown(botToken, chatID, helpText(), nil)
 		} else {
-			sendMessage(botToken, chatID,
-				"Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.", nil)
+			sendPlain(botToken, chatID,
+				"Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.\n\n"+brandFooter, nil)
 		}
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// friendlyError turns raw module errors into readable, actionable messages.
+func friendlyError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "no module found"), strings.Contains(msg, "no protocol separator"):
+		return "❌ Unsupported file type.\n\nSupported formats: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ\nSend the config as a document."
+	case strings.Contains(msg, "produced no output"), strings.Contains(msg, "no output"):
+		return "❌ Decryption produced no output.\nThis config may require an interactive password (e.g. a SlipNet bundle) which the bot cannot prompt for."
+	default:
+		return "❌ Couldn't decrypt this file:\n" + msg
+	}
 }
 
 // cleanOutput drops a stray single leading "1" line some decrypted payloads
@@ -202,35 +225,34 @@ func extractV2rayLinks(raw string) []string {
 // ---- sending helpers ----
 
 func sendRaw(token string, chatID int64, raw string) {
-	sendCode(botToken(token), chatID, raw)
+	sendCodeChunks(token, chatID, raw)
+	sendPlain(token, chatID, brandFooter, nil)
 }
 
 func sendV2rayLinks(token string, chatID int64, raw string) {
 	links := extractV2rayLinks(raw)
 	if len(links) == 0 {
-		sendMessage(botToken(token), chatID, "No v2ray links (vless:// / vmess:// / trojan:// / ss://) found in this config.", nil)
+		sendPlain(token, chatID,
+			"❌ No v2ray links (vless://  vmess://  trojan://  ss://) found in this config.\n\n"+brandFooter, nil)
 		return
 	}
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("🔗 Found %d link(s):\n\n", len(links)))
-	for _, l := range links {
-		b.WriteString(l + "\n")
-	}
-	sendCode(botToken(token), chatID, b.String())
+	intro := fmt.Sprintf("🔗 Found %d link(s). Copy the block below and paste it into your client (v2rayNG / NekoBox / Shadowrocket):\n\n%s",
+		len(links), brandFooter)
+	sendPlain(token, chatID, intro, nil)
+	sendCodeChunks(token, chatID, strings.Join(links, "\n"))
 }
-
-func botToken(token string) string { return token }
 
 // sendFormatChoice shows the colored inline buttons after a file is decrypted.
 func sendFormatChoice(token string, chatID int64, fileName string) {
-	text := fmt.Sprintf("✅ Decrypted *%s*.\nChoose how you want the output:", escapeMarkdown(fileName))
+	text := fmt.Sprintf("✅ Decrypted *%s*.\nChoose how you want the output:\n\n%s",
+		escapeMarkdown(fileName), brandFooter)
 	markup := tgInlineKeyboard{
 		InlineKeyboard: [][]tgInlineBtn{
 			{{Text: "🔵 Raw", CallbackData: "raw", Style: "primary"}},
 			{{Text: "🟢 V2Ray Links", CallbackData: "links", Style: "success"}},
 		},
 	}
-	sendMessage(token, chatID, text, markup)
+	sendMarkdown(token, chatID, text, markup)
 }
 
 type tgInlineBtn struct {
@@ -243,9 +265,18 @@ type tgInlineKeyboard struct {
 	InlineKeyboard [][]tgInlineBtn `json:"inline_keyboard"`
 }
 
-// sendMessage replies to chatID, splitting into Telegram's 4096-char chunks.
-// markup, when non-nil, is sent as reply_markup (JSON-encoded).
-func sendMessage(token string, chatID int64, text string, markup interface{}) {
+func sendPlain(token string, chatID int64, text string, markup interface{}) {
+	sendText(token, chatID, text, "", markup)
+}
+
+func sendMarkdown(token string, chatID int64, text string, markup interface{}) {
+	sendText(token, chatID, text, "Markdown", markup)
+}
+
+// sendText sends text, splitting into Telegram's 4096-char chunks.
+// parseMode is "" for plain text or "Markdown". markup, when non-nil, is sent
+// as reply_markup on the FIRST chunk only.
+func sendText(token string, chatID int64, text, parseMode string, markup interface{}) {
 	text = strings.TrimRight(text, "\n")
 	if text == "" {
 		text = "(empty result)"
@@ -258,26 +289,26 @@ func sendMessage(token string, chatID int64, text string, markup interface{}) {
 		if end > len(runes) {
 			end = len(runes)
 		}
-		chunk := string(runes[start:end])
 		params := url.Values{}
 		params.Set("chat_id", fmt.Sprintf("%d", chatID))
-		params.Set("text", chunk)
+		params.Set("text", string(runes[start:end]))
+		if parseMode != "" {
+			params.Set("parse_mode", parseMode)
+		}
 		if first && markup != nil {
 			if mb, err := json.Marshal(markup); err == nil {
 				params.Set("reply_markup", string(mb))
 			}
-			// Only the first chunk carries the buttons.
 			first = false
-		}
-		if strings.Contains(chunk, "*") {
-			params.Set("parse_mode", "Markdown")
 		}
 		_, _ = http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), params)
 	}
 }
 
-// sendCode sends text inside a fenced code block, chunked if needed.
-func sendCode(token string, chatID int64, text string) {
+// sendCodeChunks sends text inside fenced code blocks, chunked if needed.
+// ponytail: assumes decrypted configs never contain a literal ``` (true for
+// all supported formats); if they ever do, split on it instead of one fence.
+func sendCodeChunks(token string, chatID int64, text string) {
 	text = strings.TrimRight(text, "\n")
 	if text == "" {
 		text = "(empty result)"
@@ -352,18 +383,20 @@ func httpGetBytes(u string) ([]byte, error) {
 }
 
 func helpText() string {
-	return `Pantegnos Decryptor Bot
+	return `*Pantegnos Decryptor Bot* 🔓
 
 Send me an encrypted VPN / proxy config file and I will return the decrypted contents.
 
-Supported formats:
-- .npvt  NpvTunnel (NapsternetV)
-- .slip  SlipNet (v1-v28)
-- .ehi   HTTP Injector
-- .dark  DarkTunnel
-- .hat   HA Tunnel Plus
-- .nm    NetMod
-- .happ  Happ Proxy
+*Supported formats:*
+• .npvt  NpvTunnel (NapsternetV)
+• .slip  SlipNet (v1–v28)
+• .ehi   HTTP Injector
+• .dark  DarkTunnel
+• .hat   HA Tunnel Plus
+• .nm    NetMod
+• .happ  Happ Proxy
 
-Just attach the file to a message - no commands needed. After decrypting, pick *Raw* for the full dump or *V2Ray Links* for the importable vless:// vmess:// trojan:// ss:// links.`
+Just attach the file to a message — no commands needed. After decrypting, pick *Raw* for the full dump or *V2Ray Links* for the importable vless:// vmess:// trojan:// ss:// links.
+
+` + brandFooter
 }
