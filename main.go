@@ -224,10 +224,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			sendPlain(botToken, chatID, d(langOf(userID)).formats, nil)
 			w.WriteHeader(http.StatusOK)
 			return
-		case text == "/lang":
-			sendLangChoice(botToken, chatID, userID)
-			w.WriteHeader(http.StatusOK)
-			return
 		}
 	}
 
@@ -377,46 +373,12 @@ type dict struct {
 
 var dictionaries = map[langKey]dict{
 	langFA: {
-		help: `Pantegnos Decryptor Bot 🔓
+		help: `Pantegnos — ربات رمزگشایی پیکربندی
 
-یک فایل پیکربندی رمزنشده VPN / پروکسی بفرستید تا متن رمزگشایی‌شده را برگردانم.
+فایل پیکربندی رمزنشدهٔ VPN یا پروکسی را به عنوان سند بفرستید تا متن آن را برگردانم.
 
-فرمت‌های پشتیبانی شده:
+فرمت‌های پشتیبانی‌شده:
 • .npvt  NpvTunnel (NapsternetV)
-• .slip  SlipNet (v1–v28)
-• .ehi   HTTP Injector
-• .dark  DarkTunnel
-• .hat   HA Tunnel Plus
-• .nm    NetMod
-• .happ  Happ Proxy
-
-فقط کافیست فایل را به عنوان سند بفرستید — نیازی به دستور نیست. پس از رمزگشایی، «Raw» را برای خروجی کامل یا «V2Ray Links» را برای لینک‌های قابل ایمپورت انتخاب کنید.
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		formatChoice: `✅ فایل %s رمزگشایی شد.
-انتخاب کنید چطور خروجی را می‌خواهید:
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		unsupported: `❌ نوع فایل پشتیبانی نمی‌شود.
-
-فرمت‌های پشتیبانی شده: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ
-فایل را به عنوان سند بفرستید.
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		noDoc: `فایل پیکربندی (.npvt، .slip، .ehi، .dark، .hat، .nm، .happ) را به عنوان سند بفرستید تا رمزگشایی‌اش کنم.
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		sessionExpired: `⏳ نشست منقضی شد — لطفاً فایل را دوباره بفرستید.
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		noLinks: `❌ هیچ لینک v2ray (vless://  vmess://  trojan://  ss://) در این پیکربندی یافت نشد.
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		linksIntro: `🔗 %d لینک یافت شد. بلوک زیر را کپی کرده و در کلاینت خود (v2rayNG / NekoBox / Shadowrocket) جای‌گذاری کنید:
-
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		formats: `فرمت‌های پشتیبانی شده:
-• .npvt  NpvTunnel
 • .slip  SlipNet
 • .ehi   HTTP Injector
 • .dark  DarkTunnel
@@ -424,52 +386,58 @@ var dictionaries = map[langKey]dict{
 • .nm    NetMod
 • .happ  Happ Proxy
 
-🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
-		brand:   `🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+پس از رمزگشایی، یکی را انتخاب کنید: خروجی کامل (Raw) یا لینک‌های قابل ایمپورت (V2Ray Links).
+
+— @LimooDecryptorbot`,
+		formatChoice: `✅ فایل %s رمزگشایی شد.
+چطور خروجی را نشان بدهد؟`,
+		unsupported: `❌ فرمت پشتیبانی‌نشده.
+فرمت‌های مجاز: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ
+فایل را به عنوان سند بفرستید.`,
+		noDoc: `یک فایل پیکربندی (.npvt، .slip، .ehi، .dark، .hat، .nm، .happ) را به عنوان سند بفرستید تا رمزگشایی‌اش کنم.`,
+		sessionExpired: `⏳ نشست منقضی شد — فایل را دوباره بفرستید.`,
+		noLinks: `❌ لینک v2ray (vless://  vmess://  trojan://  ss://) در این پیکربندی پیدا نشد.`,
+		linksIntro: `🔗 %d لینک پیدا شد. بلوک زیر را در کلاینت خود (v2rayNG / NekoBox / Shadowrocket) جای‌گذاری کنید:`,
+		formats: `فرمت‌های پشتیبانی‌شده:
+• .npvt  NpvTunnel
+• .slip  SlipNet
+• .ehi   HTTP Injector
+• .dark  DarkTunnel
+• .hat   HA Tunnel Plus
+• .nm    NetMod
+• .happ  Happ Proxy`,
+		brand:   `— @LimooDecryptorbot`,
 		langSet: `✅ زبان روی %s تنظیم شد.`,
 		langUsage: `زبان را با یکی از دستورات زیر تغییر دهید:
 /lang fa  — فارسی
 /lang en  — English`,
 	},
 	langEN: {
-		help: `*Pantegnos Decryptor Bot* 🔓
+		help: `Pantegnos — Config Decryptor
 
-Send me an encrypted VPN / proxy config file and I will return the decrypted contents.
+Send an encrypted VPN or proxy config file as a document and I'll return the decrypted contents.
 
-*Supported formats:*
+Supported formats:
 • .npvt  NpvTunnel (NapsternetV)
-• .slip  SlipNet (v1–v28)
+• .slip  SlipNet
 • .ehi   HTTP Injector
 • .dark  DarkTunnel
 • .hat   HA Tunnel Plus
 • .nm    NetMod
 • .happ  Happ Proxy
 
-Just attach the file to a message — no commands needed. After decrypting, pick *Raw* for the full dump or *V2Ray Links* for the importable vless:// vmess:// trojan:// ss:// links.
+After decrypting, pick one: the full output (Raw) or the importable links (V2Ray Links).
 
-🔓 Decrypted by @LimooDecryptorbot`,
+— @LimooDecryptorbot`,
 		formatChoice: `✅ Decrypted *%s*.
-Choose how you want the output:
-
-🔓 Decrypted by @LimooDecryptorbot`,
+How would you like the output?`,
 		unsupported: `❌ Unsupported file type.
-
-Supported formats: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ
-Send the config as a document.
-
-🔓 Decrypted by @LimooDecryptorbot`,
-		noDoc: `Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.
-
-🔓 Decrypted by @LimooDecryptorbot`,
-		sessionExpired: `⏳ Session expired — please resend the config file to get fresh options.
-
-🔓 Decrypted by @LimooDecryptorbot`,
-		noLinks: `❌ No v2ray links (vless://  vmess://  trojan://  ss://) found in this config.
-
-🔓 Decrypted by @LimooDecryptorbot`,
-		linksIntro: `🔗 Found %d link(s). Copy the block below and paste it into your client (v2rayNG / NekoBox / Shadowrocket):
-
-🔓 Decrypted by @LimooDecryptorbot`,
+Allowed: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ
+Send the config as a document.`,
+		noDoc: `Send a config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I'll decrypt it for you.`,
+		sessionExpired: `⏳ Session expired — please resend the file.`,
+		noLinks: `❌ No v2ray links (vless://  vmess://  trojan://  ss://) found in this config.`,
+		linksIntro: `🔗 Found %d link(s). Paste the block below into your client (v2rayNG / NekoBox / Shadowrocket):`,
 		formats: `Supported formats:
 • .npvt  NpvTunnel
 • .slip  SlipNet
@@ -477,10 +445,8 @@ Send the config as a document.
 • .dark  DarkTunnel
 • .hat   HA Tunnel Plus
 • .nm    NetMod
-• .happ  Happ Proxy
-
-🔓 Decrypted by @LimooDecryptorbot`,
-		brand:   `🔓 Decrypted by @LimooDecryptorbot`,
+• .happ  Happ Proxy`,
+		brand:   `— @LimooDecryptorbot`,
 		langSet: `✅ Language set to %s.`,
 		langUsage: `Change language with:
 /lang fa  — فارسی
