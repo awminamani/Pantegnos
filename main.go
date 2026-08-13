@@ -173,6 +173,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			switch cq.Data {
 			case "links":
 				sendV2rayLinks(botToken, chatID, userID, raw)
+			case "lang:fa":
+				setLang(userID, langFA, true)
+				sendPlain(botToken, chatID, fmt.Sprintf(d(langFA).langSet, "فارسی"), nil)
+			case "lang:en":
+				setLang(userID, langEN, true)
+				sendPlain(botToken, chatID, fmt.Sprintf(d(langEN).langSet, "English"), nil)
+			case "lang:menu":
+				sendLangChoice(botToken, chatID, userID)
 			default:
 				sendRaw(botToken, chatID, userID, raw)
 			}
@@ -212,8 +220,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			sendPlain(botToken, chatID, d(langOf(userID)).formats, nil)
 			w.WriteHeader(http.StatusOK)
 			return
-		case strings.HasPrefix(text, "/"):
-			sendPlain(botToken, chatID, d(langOf(userID)).noDoc, nil)
+		case text == "/lang":
+			sendLangChoice(botToken, chatID, userID)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -580,6 +588,22 @@ func sendFormatChoice(token string, chatID, userID int64, fileName string) {
 		InlineKeyboard: [][]tgInlineBtn{
 			{{Text: "🔵 Raw", CallbackData: "raw", Style: "primary"}},
 			{{Text: "🟢 V2Ray Links", CallbackData: "links", Style: "success"}},
+		},
+	}
+	sendMarkdown(token, chatID, text, markup)
+}
+
+func sendLangChoice(token string, chatID, userID int64) {
+	l := langOf(userID)
+	text := "🌐 " + d(l).langUsage
+	current := ""
+	if l == langFA {
+		current = " ✅"
+	}
+	markup := tgInlineKeyboard{
+		InlineKeyboard: [][]tgInlineBtn{
+			{{Text: "🇮🇷 فارسی" + current, CallbackData: "lang:fa", Style: "primary"}},
+			{{Text: "🇬🇧 English", CallbackData: "lang:en", Style: "success"}},
 		},
 	}
 	sendMarkdown(token, chatID, text, markup)
