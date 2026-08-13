@@ -5,6 +5,24 @@ import (
 	"testing"
 )
 
+func TestToV2rayJSONConcat(t *testing.T) {
+	raw := `[{"a":1}]{"b":2}`
+	out, n := toV2rayJSON(raw)
+	if n != 2 {
+		t.Fatalf("got %d docs, want 2", n)
+	}
+	if !strings.Contains(out, `"a": 1`) || !strings.Contains(out, `"b": 2`) {
+		t.Fatalf("concatenated JSON not pretty-printed: %s", out)
+	}
+}
+
+func TestToV2rayJSONSingle(t *testing.T) {
+	raw := `{"server":"1.2.3.4","port":443}`
+	out, n := toV2rayJSON(raw)
+	if n != 1 || !strings.Contains(out, `"port": 443`) {
+		t.Fatalf("single JSON not handled: n=%d out=%s", n, out)
+	}
+}
 func TestExtractV2rayLinks(t *testing.T) {
 	raw := "intro text\nvless://abc@1.2.3.4:443?encryption=none#r1\nvmess://eyJ2IjoiMiJ9\nnot a link\n trojan://pass@5.6.7.8:443#r2\nss://base64@9.9.9.9:8388#r3\n"
 	got := extractV2rayLinks(raw)

@@ -627,14 +627,36 @@ func sendJSON(token string, chatID, userID int64, raw string) {
 
 // toV2rayJSON: if raw is already JSON, pretty-print it; else build a JSON
 // array of v2rayN/sing-box outbounds from any vless:// vmess:// trojan:// ss://
-// URIs. Returns the JSON text and the number of outbounds/objects emitted.
+// URIs. Returns the JSON text and the number of JSON values/objects emitted.
+// The decryptor may write several concatenated JSON documents (e.g. a v2rayN
+// subscription array followed by a trailing lockConfig object), so a single
+// json.Valid() call can't see them — we decode the whole stream instead.
 func toV2rayJSON(raw string) (string, int) {
 	trimmed := strings.TrimSpace(raw)
-	if json.Valid([]byte(trimmed)) && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
+	// Single valid JSON document: pretty-print directly.
+	if json.Valid([]byte(trimmed)) {
 		var pretty bytes.Buffer
 		if json.Indent(&pretty, []byte(trimmed), "", "  ") == nil {
 			return pretty.String(), 1
 		}
+	}
+	// Multiple concatenated JSON documents: decode the stream and re-emit
+	// every top-level value we can parse.
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	var parts []string
+	for {
+		var v interface{}
+		if err := dec.Decode(&v); err != nil {
+			break // io.EOF (exhausted) or first malformed chunk stops us
+		}
+		b, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			break
+		}
+		parts = append(parts, string(b))
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n\n"), len(parts)
 	}
 	links := extractV2rayLinks(raw)
 	if len(links) == 0 {
