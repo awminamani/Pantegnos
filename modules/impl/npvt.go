@@ -28,7 +28,7 @@ func init() {
 			blobs, err := loadBlobsFromFile(file)
 			if err != nil {
 				fmt.Println("error loading file:", err)
-				os.Exit(1)
+				return
 			}
 			var dataList = blobs
 

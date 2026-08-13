@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 
 	"Pantegnos/modules"
 
@@ -17,17 +19,42 @@ import (
 
 // tgUpdate is the subset of the Telegram Update object we handle.
 type tgUpdate struct {
-	Message *struct {
+	Message       *tgMessage       `json:"message"`
+	CallbackQuery *tgCallbackQuery `json:"callback_query"`
+}
+
+type tgMessage struct {
+	Chat struct {
+		ID int64 `json:"id"`
+	} `json:"chat"`
+	Text     string `json:"text"`
+	Document *struct {
+		FileName string `json:"file_name"`
+		FileID   string `json:"file_id"`
+	} `json:"document"`
+}
+
+type tgCallbackQuery struct {
+	ID      string `json:"id"`
+	Data    string `json:"data"`
+	Message struct {
 		Chat struct {
 			ID int64 `json:"id"`
 		} `json:"chat"`
-		Text     string `json:"text"`
-		Document *struct {
-			FileName string `json:"file_name"`
-			FileID   string `json:"file_id"`
-		} `json:"document"`
 	} `json:"message"`
 }
+
+// pendingDoc holds the last decrypted payload per chat so the inline format
+// buttons can format it on tap without re-downloading the file.
+// ponytail: in-memory map; single Vercel instance is fine. Use a shared
+// store (Redis) if you scale to multiple instances.
+var (
+	pendingMu sync.Mutex
+	pending   = map[int64]string{}
+)
+
+// linkRe matches v2ray-family URIs already emitted by the decoders.
+var linkRe = regexp.MustCompile(`(?:vless|vmess|trojan|ss)://\S+`)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -80,6 +107,32 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	if botToken == "" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Callback from a format-choice button.
+	if upd.CallbackQuery != nil {
+		cq := upd.CallbackQuery
+		chatID := cq.Message.Chat.ID
+		pendingMu.Lock()
+		raw, ok := pending[chatID]
+		pendingMu.Unlock()
+		if ok {
+			switch cq.Data {
+			case "links":
+				sendV2rayLinks(botToken, chatID, raw)
+			default:
+				sendRaw(botToken, chatID, raw)
+			}
+		}
+		answerCallback(botToken, cq.ID)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if upd.Message == nil {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -88,36 +141,47 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	chatID := upd.Message.Chat.ID
 
 	if upd.Message.Document != nil {
-		if botToken == "" {
+		doc := upd.Message.Document
+		raw, procErr := processDocument(botToken, doc.FileID, doc.FileName)
+		if procErr != nil {
+			sendMessage(botToken, chatID, "Failed to decrypt: "+procErr.Error(), nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		doc := upd.Message.Document
-		out, procErr := processDocument(botToken, doc.FileID, doc.FileName)
-		if procErr != nil {
-			sendMessage(botToken, chatID, "Failed to decrypt: "+procErr.Error())
-		} else {
-			sendMessage(botToken, chatID, out)
-		}
+		raw = cleanOutput(raw)
+		pendingMu.Lock()
+		pending[chatID] = raw
+		pendingMu.Unlock()
+		sendFormatChoice(botToken, chatID, doc.FileName)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	if strings.TrimSpace(upd.Message.Text) != "" {
-		if botToken == "" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
 		text := strings.TrimSpace(upd.Message.Text)
 		if text == "/start" || text == "/help" {
-			sendMessage(botToken, chatID, helpText())
+			sendMessage(botToken, chatID, helpText(), nil)
 		} else {
 			sendMessage(botToken, chatID,
-				"Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.")
+				"Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.", nil)
 		}
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// cleanOutput drops a stray single leading "1" line some decrypted payloads
+// carry. V2ray schemes never start with '1', so this can't corrupt a real
+// config. If a sample still shows a stray '1', capture it to refine this.
+func cleanOutput(s string) string {
+	s = strings.TrimRight(s, "\n")
+	if strings.HasPrefix(s, "1\n") {
+		return s[2:]
+	}
+	if len(s) > 1 && s[0] == '1' && (s[1] == '\n' || strings.HasPrefix(s[1:], "://")) {
+		return s[1:]
+	}
+	return s
 }
 
 func processDocument(token, fileID, fileName string) (string, error) {
@@ -129,6 +193,123 @@ func processDocument(token, fileID, fileName string) (string, error) {
 		return "", fmt.Errorf("failed to download file: %w", err)
 	}
 	return modules.Process(fileName, data)
+}
+
+func extractV2rayLinks(raw string) []string {
+	return linkRe.FindAllString(raw, -1)
+}
+
+// ---- sending helpers ----
+
+func sendRaw(token string, chatID int64, raw string) {
+	sendCode(botToken(token), chatID, raw)
+}
+
+func sendV2rayLinks(token string, chatID int64, raw string) {
+	links := extractV2rayLinks(raw)
+	if len(links) == 0 {
+		sendMessage(botToken(token), chatID, "No v2ray links (vless:// / vmess:// / trojan:// / ss://) found in this config.", nil)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("🔗 Found %d link(s):\n\n", len(links)))
+	for i, l := range links {
+		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, l))
+	}
+	sendCode(botToken(token), chatID, b.String())
+}
+
+func botToken(token string) string { return token }
+
+// sendFormatChoice shows the colored inline buttons after a file is decrypted.
+func sendFormatChoice(token string, chatID int64, fileName string) {
+	text := fmt.Sprintf("✅ Decrypted *%s*.\nChoose how you want the output:", escapeMarkdown(fileName))
+	markup := tgInlineKeyboard{
+		InlineKeyboard: [][]tgInlineBtn{
+			{{Text: "🔵 Raw", CallbackData: "raw", Style: "primary"}},
+			{{Text: "🟢 V2Ray Links", CallbackData: "links", Style: "success"}},
+		},
+	}
+	sendMessage(token, chatID, text, markup)
+}
+
+type tgInlineBtn struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data,omitempty"`
+	Style        string `json:"style,omitempty"`
+}
+
+type tgInlineKeyboard struct {
+	InlineKeyboard [][]tgInlineBtn `json:"inline_keyboard"`
+}
+
+// sendMessage replies to chatID, splitting into Telegram's 4096-char chunks.
+// markup, when non-nil, is sent as reply_markup (JSON-encoded).
+func sendMessage(token string, chatID int64, text string, markup interface{}) {
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		text = "(empty result)"
+	}
+	const max = 4000
+	runes := []rune(text)
+	first := true
+	for start := 0; start < len(runes); start += max {
+		end := start + max
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunk := string(runes[start:end])
+		params := url.Values{}
+		params.Set("chat_id", fmt.Sprintf("%d", chatID))
+		params.Set("text", chunk)
+		if first && markup != nil {
+			if mb, err := json.Marshal(markup); err == nil {
+				params.Set("reply_markup", string(mb))
+			}
+			// Only the first chunk carries the buttons.
+			first = false
+		}
+		if strings.Contains(chunk, "*") {
+			params.Set("parse_mode", "Markdown")
+		}
+		_, _ = http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), params)
+	}
+}
+
+// sendCode sends text inside a fenced code block, chunked if needed.
+func sendCode(token string, chatID int64, text string) {
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		text = "(empty result)"
+	}
+	const max = 3900
+	runes := []rune(text)
+	for start := 0; start < len(runes); start += max {
+		end := start + max
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunk := "```\n" + string(runes[start:end]) + "\n```"
+		params := url.Values{}
+		params.Set("chat_id", fmt.Sprintf("%d", chatID))
+		params.Set("text", chunk)
+		params.Set("parse_mode", "Markdown")
+		_, _ = http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), params)
+	}
+}
+
+func answerCallback(token, callbackID string) {
+	if callbackID == "" {
+		return
+	}
+	params := url.Values{}
+	params.Set("callback_query_id", callbackID)
+	_, _ = http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token), params)
+}
+
+func escapeMarkdown(s string) string {
+	re := regexp.MustCompile(`([_*\[\]()~` + "`" + `>#+\-=|{}.!])`)
+	return re.ReplaceAllString(s, "\\$1")
 }
 
 func fetchFile(token, fileID string) ([]byte, error) {
@@ -170,26 +351,6 @@ func httpGetBytes(u string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// sendMessage replies to chatID, splitting into Telegram's 4096-char chunks.
-func sendMessage(token string, chatID int64, text string) {
-	text = strings.TrimRight(text, "\n")
-	if text == "" {
-		text = "(empty result)"
-	}
-	const max = 4000
-	runes := []rune(text)
-	for start := 0; start < len(runes); start += max {
-		end := start + max
-		if end > len(runes) {
-			end = len(runes)
-		}
-		data := url.Values{}
-		data.Set("chat_id", fmt.Sprintf("%d", chatID))
-		data.Set("text", string(runes[start:end]))
-		_, _ = http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), data)
-	}
-}
-
 func helpText() string {
 	return `Pantegnos Decryptor Bot
 
@@ -204,5 +365,5 @@ Supported formats:
 - .nm    NetMod
 - .happ  Happ Proxy
 
-Just attach the file to a message - no commands needed.`
+Just attach the file to a message - no commands needed. After decrypting, pick *Raw* for the full dump or *V2Ray Links* for the importable vless:// vmess:// trojan:// ss:// links.`
 }
