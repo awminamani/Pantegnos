@@ -28,6 +28,7 @@ type tgUpdate struct {
 
 type tgFrom struct {
 	ID           int64  `json:"id"`
+	FirstName    string `json:"first_name"`
 	LanguageCode string `json:"language_code"`
 }
 
@@ -201,9 +202,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	chatID := upd.Message.Chat.ID
 	userID := int64(0)
+	firstName := ""
 	if upd.Message.From != nil {
-		userID = upd.Message.From.ID
-		setLangFromUser(userID, upd.Message.From)
+	userID = upd.Message.From.ID
+	firstName = upd.Message.From.FirstName
+	setLangFromUser(userID, upd.Message.From)
 	}
 
 	// Commands.
@@ -219,7 +222,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		case text == "/start" || text == "/help":
-			sendPlain(botToken, chatID, d(langOf(userID)).help, nil)
+			sendPlain(botToken, chatID, fmt.Sprintf(d(langOf(userID)).help, firstName), nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		case text == "/formats":
@@ -377,7 +380,9 @@ type dict struct {
 
 var dictionaries = map[langKey]dict{
 	langFA: {
-		help: `Pantegnos — ربات رمزگشایی پیکربندی
+		help: `سلام %s 👋
+
+ربات رمزگشایی پیکربندی
 
 فایل پیکربندی رمزنشدهٔ VPN یا پروکسی را به عنوان سند بفرستید تا متن آن را برگردانم.
 
@@ -419,7 +424,9 @@ var dictionaries = map[langKey]dict{
 /lang en  — English`,
 	},
 	langEN: {
-		help: `Pantegnos — Config Decryptor
+		help: `Hi %s 👋
+
+Config Decryptor
 
 Send an encrypted VPN or proxy config file as a document and I'll return the decrypted contents.
 
