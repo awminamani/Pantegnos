@@ -173,6 +173,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			switch cq.Data {
 			case "links":
 				sendV2rayLinks(botToken, chatID, userID, raw)
+			case "json":
+				sendJSON(botToken, chatID, userID, raw)
 			case "lang:fa":
 				setLang(userID, langFA, true)
 				sendPlain(botToken, chatID, fmt.Sprintf(d(langFA).langSet, "فارسی"), nil)
@@ -365,6 +367,8 @@ type dict struct {
 	sessionExpired string
 	noLinks        string
 	linksIntro     string // %d
+	jsonIntro      string // %d
+	notJson        string
 	formats        string
 	brand          string
 	langSet        string // %s = language name
@@ -408,6 +412,8 @@ var dictionaries = map[langKey]dict{
 • .happ  Happ Proxy`,
 		brand:   `— @LimooDecryptorbot`,
 		langSet: `✅ زبان روی %s تنظیم شد.`,
+		jsonIntro: `🔧 %d خروجی به فرمت JSON (v2rayN / sing-box) آماده شد:`,
+		notJson:   `❌ این پیکربندی نه لینک v2ray دارد و نه متن JSON معتبر — خروجی Raw را بررسی کنید.`,
 		langUsage: `زبان را با یکی از دستورات زیر تغییر دهید:
 /lang fa  — فارسی
 /lang en  — English`,
@@ -448,6 +454,8 @@ Send the config as a document.`,
 • .happ  Happ Proxy`,
 		brand:   `— @LimooDecryptorbot`,
 		langSet: `✅ Language set to %s.`,
+		jsonIntro: `🔧 %d JSON output (v2rayN / sing-box) ready:`,
+		notJson:   `❌ This config has neither v2ray links nor valid JSON text — check the Raw output.`,
 		langUsage: `Change language with:
 /lang fa  — فارسی
 /lang en  — English`,
@@ -558,6 +566,7 @@ func sendFormatChoice(token string, chatID, userID int64, fileName string) {
 		InlineKeyboard: [][]tgInlineBtn{
 			{{Text: "🔵 Raw", CallbackData: "raw", Style: "primary"}},
 			{{Text: "🟢 V2Ray Links", CallbackData: "links", Style: "success"}},
+			{{Text: "🟡 JSON", CallbackData: "json", Style: "warning"}},
 		},
 	}
 	sendMarkdown(token, chatID, text, markup)
@@ -594,6 +603,63 @@ func sendV2rayLinks(token string, chatID, userID int64, raw string) {
 	intro := fmt.Sprintf(d(l).linksIntro, len(links))
 	sendPlain(token, chatID, intro, nil)
 	sendCodeChunks(token, chatID, strings.Join(links, "\n"))
+}
+
+// sendJSON re-emits raw as JSON: either pretty-print if the decryptor already
+// produced JSON, or convert extracted v2ray URIs into v2rayN/sing-box outbounds.
+func sendJSON(token string, chatID, userID int64, raw string) {
+	l := langOf(userID)
+	out, n := toV2rayJSON(raw)
+	if n == 0 {
+		sendPlain(token, chatID, d(l).notJson, nil)
+		return
+	}
+	sendPlain(token, chatID, fmt.Sprintf(d(l).jsonIntro, n), nil)
+	sendCodeChunks(token, chatID, out)
+}
+
+// toV2rayJSON: if raw is already JSON, pretty-print it; else build a JSON
+// array of v2rayN/sing-box outbounds from any vless:// vmess:// trojan:// ss://
+// URIs. Returns the JSON text and the number of outbounds/objects emitted.
+func toV2rayJSON(raw string) (string, int) {
+	trimmed := strings.TrimSpace(raw)
+	if json.Valid([]byte(trimmed)) && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, []byte(trimmed), "", "  ") == nil {
+			return pretty.String(), 1
+		}
+	}
+	links := extractV2rayLinks(raw)
+	if len(links) == 0 {
+		return "", 0
+	}
+	outbounds := make([]map[string]interface{}, 0, len(links))
+	for i, link := range links {
+		tag := fmt.Sprintf("proxy-%d", i+1)
+		outbounds = append(outbounds, map[string]interface{}{
+			"tag":      tag,
+			"type":     protocolOf(link),
+			"protocol": protocolOf(link),
+			"settings": map[string]interface{}{
+				"v2ray_link": link,
+			},
+		})
+	}
+	doc := map[string]interface{}{
+		"outbounds": outbounds,
+	}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return "", 0
+	}
+	return string(b), len(outbounds)
+}
+
+func protocolOf(link string) string {
+	if i := strings.Index(link, "://"); i > 0 {
+		return link[:i]
+	}
+	return "unknown"
 }
 
 type tgInlineBtn struct {
