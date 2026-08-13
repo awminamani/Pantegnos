@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,24 +12,33 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"Pantegnos/modules"
 
 	_ "Pantegnos/modules/impl"
 )
 
-// tgUpdate is the subset of the Telegram Update object we handle.
+// ---- Telegram update structs ----
+
 type tgUpdate struct {
 	Message       *tgMessage       `json:"message"`
 	CallbackQuery *tgCallbackQuery `json:"callback_query"`
+}
+
+type tgFrom struct {
+	ID           int64  `json:"id"`
+	LanguageCode string `json:"language_code"`
 }
 
 type tgMessage struct {
 	Chat struct {
 		ID int64 `json:"id"`
 	} `json:"chat"`
-	Text     string `json:"text"`
-	Document *struct {
+	From         *tgFrom `json:"from"`
+	Text         string  `json:"text"`
+	MediaGroupID string  `json:"media_group_id"`
+	Document     *struct {
 		FileName string `json:"file_name"`
 		FileID   string `json:"file_id"`
 	} `json:"document"`
@@ -37,6 +47,7 @@ type tgMessage struct {
 type tgCallbackQuery struct {
 	ID      string `json:"id"`
 	Data    string `json:"data"`
+	From    *tgFrom `json:"from"`
 	Message struct {
 		Chat struct {
 			ID int64 `json:"id"`
@@ -44,25 +55,51 @@ type tgCallbackQuery struct {
 	} `json:"message"`
 }
 
-// pendingDoc holds the last decrypted payload per chat so the inline format
-// buttons can format it on tap without re-downloading the file.
-// ponytail: in-memory map, single Vercel instance is fine. Use a shared
-// store (Redis) if you scale to multiple instances or need cross-restart persistence.
+type tgCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// ---- per-user state ----
+
+// pending holds the last decrypted payload per USER (not chat) so the inline
+// format buttons resolve correctly even in group chats where many users share
+// one chat_id. ponytail: in-memory; single Vercel instance is fine.
 var (
 	pendingMu sync.Mutex
-	pending   = map[int64]string{}
+	pending   = map[int64]string{} // userID -> last decrypted raw
+
+	langMu           sync.Mutex
+	userLang         = map[int64]langKey{}
+	userLangExplicit = map[int64]bool{}
+
+	albumMu  sync.Mutex
+	albumBuf = map[string]*albumBatch{} // media_group_id -> batch
 )
+
+type albumBatch struct {
+	timer  *time.Timer
+	files  []pendingFile
+	chatID int64
+	userID int64
+}
+
+type pendingFile struct {
+	fileID   string
+	fileName string
+}
 
 // linkRe matches v2ray-family URIs already emitted by the decoders.
 var linkRe = regexp.MustCompile(`(?:vless|vmess|trojan|ss)://\S+`)
-
-// brandFooter is the watermark shown on outputs and help.
-const brandFooter = "🔓 Decrypted by @LimooDecryptorbot"
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+	}
+	token := os.Getenv("BOT_TOKEN")
+	if token != "" {
+		go registerCommands(token)
 	}
 	http.HandleFunc("/", handler)
 	log.Printf("Pantegnos bot listening on :%s", port)
@@ -120,23 +157,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Callback from a format-choice button.
+	// Callback from a format-choice button. State is keyed by the user who
+	// tapped, so group chats don't cross wires.
 	if upd.CallbackQuery != nil {
 		cq := upd.CallbackQuery
 		chatID := cq.Message.Chat.ID
+		userID := int64(0)
+		if cq.From != nil {
+			userID = cq.From.ID
+		}
 		pendingMu.Lock()
-		raw, ok := pending[chatID]
+		raw, ok := pending[userID]
 		pendingMu.Unlock()
 		if ok {
 			switch cq.Data {
 			case "links":
-				sendV2rayLinks(botToken, chatID, raw)
+				sendV2rayLinks(botToken, chatID, userID, raw)
 			default:
-				sendRaw(botToken, chatID, raw)
+				sendRaw(botToken, chatID, userID, raw)
 			}
 		} else {
-			sendPlain(botToken, chatID,
-				"⏳ Session expired — please resend the config file to get fresh options.\n\n"+brandFooter, nil)
+			sendPlain(botToken, chatID, d(langOf(userID)).sessionExpired, nil)
 		}
 		answerCallback(botToken, cq.ID)
 		w.WriteHeader(http.StatusOK)
@@ -149,38 +190,118 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chatID := upd.Message.Chat.ID
+	userID := int64(0)
+	if upd.Message.From != nil {
+		userID = upd.Message.From.ID
+		setLangFromUser(userID, upd.Message.From)
+	}
 
+	// Commands.
+	if strings.TrimSpace(upd.Message.Text) != "" {
+		text := strings.TrimSpace(upd.Message.Text)
+		switch {
+		case strings.HasPrefix(text, "/lang"):
+			handleLang(botToken, chatID, userID, text)
+			w.WriteHeader(http.StatusOK)
+			return
+		case text == "/start" || text == "/help":
+			sendPlain(botToken, chatID, d(langOf(userID)).help, nil)
+			w.WriteHeader(http.StatusOK)
+			return
+		case text == "/formats":
+			sendPlain(botToken, chatID, d(langOf(userID)).formats, nil)
+			w.WriteHeader(http.StatusOK)
+			return
+		case strings.HasPrefix(text, "/"):
+			sendPlain(botToken, chatID, d(langOf(userID)).noDoc, nil)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+
+	// Documents (single file or album).
 	if upd.Message.Document != nil {
 		doc := upd.Message.Document
-		raw, procErr := processDocument(botToken, doc.FileID, doc.FileName)
+		fn := doc.FileName
+		if fn == "" {
+			fn = "config.bin"
+		}
+		mg := upd.Message.MediaGroupID
+		if mg != "" {
+			// Debounce the album: collect all parts, then process together.
+			scheduleAlbum(botToken, mg, chatID, userID, pendingFile{doc.FileID, fn})
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		raw, procErr := processDocument(botToken, doc.FileID, fn)
 		if procErr != nil {
-			sendPlain(botToken, chatID, friendlyError(procErr)+"\n\n"+brandFooter, nil)
+			sendPlain(botToken, chatID, friendlyError(procErr)+"\n\n"+d(langOf(userID)).brand, nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		raw = cleanOutput(raw)
 		pendingMu.Lock()
-		pending[chatID] = raw
+		pending[userID] = raw
 		pendingMu.Unlock()
-		sendFormatChoice(botToken, chatID, doc.FileName)
+		sendFormatChoice(botToken, chatID, userID, fn)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
+	// Plain text that wasn't a command.
 	if strings.TrimSpace(upd.Message.Text) != "" {
-		text := strings.TrimSpace(upd.Message.Text)
-		if text == "/start" || text == "/help" {
-			sendMarkdown(botToken, chatID, helpText(), nil)
-		} else {
-			sendPlain(botToken, chatID,
-				"Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.\n\n"+brandFooter, nil)
-		}
+		sendPlain(botToken, chatID, d(langOf(userID)).noDoc, nil)
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
-// friendlyError turns raw module errors into readable, actionable messages.
+// ---- album batching ----
+
+func scheduleAlbum(token, mgID string, chatID, userID int64, f pendingFile) {
+	albumMu.Lock()
+	b, ok := albumBuf[mgID]
+	if !ok {
+		b = &albumBatch{chatID: chatID, userID: userID}
+		albumBuf[mgID] = b
+		b.timer = time.AfterFunc(1500*time.Millisecond, func() {
+			albumMu.Lock()
+			delete(albumBuf, mgID)
+			files := b.files
+			albumMu.Unlock()
+			processAlbum(token, chatID, userID, files)
+		})
+	}
+	b.files = append(b.files, f)
+	albumMu.Unlock()
+}
+
+func processAlbum(token string, chatID, userID int64, files []pendingFile) {
+	var parts, names []string
+	for _, f := range files {
+		raw, err := processDocument(token, f.fileID, f.fileName)
+		if err != nil {
+			raw = friendlyError(err)
+		} else {
+			raw = cleanOutput(raw)
+		}
+		names = append(names, f.fileName)
+		if raw != "" {
+			parts = append(parts, raw)
+		}
+	}
+	combined := strings.Join(parts, "\n\n────────────\n\n")
+	if combined == "" {
+		combined = "(empty result)"
+	}
+	pendingMu.Lock()
+	pending[userID] = combined
+	pendingMu.Unlock()
+	sendFormatChoice(token, chatID, userID, strings.Join(names, ", "))
+}
+
+// ---- error handling ----
+
 func friendlyError(err error) string {
 	msg := err.Error()
 	switch {
@@ -208,9 +329,6 @@ func cleanOutput(s string) string {
 }
 
 func processDocument(token, fileID, fileName string) (string, error) {
-	if fileName == "" {
-		fileName = "config.bin"
-	}
 	data, err := fetchFile(token, fileID)
 	if err != nil {
 		return "", fmt.Errorf("failed to download file: %w", err)
@@ -222,30 +340,242 @@ func extractV2rayLinks(raw string) []string {
 	return linkRe.FindAllString(raw, -1)
 }
 
-// ---- sending helpers ----
+// ---- localization ----
 
-func sendRaw(token string, chatID int64, raw string) {
-	sendCodeChunks(token, chatID, raw)
-	sendPlain(token, chatID, brandFooter, nil)
+type langKey string
+
+const (
+	langFA langKey = "fa"
+	langEN langKey = "en"
+)
+
+type dict struct {
+	help           string
+	formatChoice   string // %s = filename
+	unsupported    string
+	noDoc          string
+	sessionExpired string
+	noLinks        string
+	linksIntro     string // %d
+	formats        string
+	brand          string
+	langSet        string // %s = language name
+	langUsage      string
 }
 
-func sendV2rayLinks(token string, chatID int64, raw string) {
-	links := extractV2rayLinks(raw)
-	if len(links) == 0 {
-		sendPlain(token, chatID,
-			"❌ No v2ray links (vless://  vmess://  trojan://  ss://) found in this config.\n\n"+brandFooter, nil)
+var dictionaries = map[langKey]dict{
+	langFA: {
+		help: `Pantegnos Decryptor Bot 🔓
+
+یک فایل پیکربندی رمزنشده VPN / پروکسی بفرستید تا متن رمزگشایی‌شده را برگردانم.
+
+فرمت‌های پشتیبانی شده:
+• .npvt  NpvTunnel (NapsternetV)
+• .slip  SlipNet (v1–v28)
+• .ehi   HTTP Injector
+• .dark  DarkTunnel
+• .hat   HA Tunnel Plus
+• .nm    NetMod
+• .happ  Happ Proxy
+
+فقط کافیست فایل را به عنوان سند بفرستید — نیازی به دستور نیست. پس از رمزگشایی، «Raw» را برای خروجی کامل یا «V2Ray Links» را برای لینک‌های قابل ایمپورت انتخاب کنید.
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		formatChoice: `✅ فایل %s رمزگشایی شد.
+انتخاب کنید چطور خروجی را می‌خواهید:
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		unsupported: `❌ نوع فایل پشتیبانی نمی‌شود.
+
+فرمت‌های پشتیبانی شده: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ
+فایل را به عنوان سند بفرستید.
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		noDoc: `فایل پیکربندی (.npvt، .slip، .ehi، .dark، .hat، .nm، .happ) را به عنوان سند بفرستید تا رمزگشایی‌اش کنم.
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		sessionExpired: `⏳ نشست منقضی شد — لطفاً فایل را دوباره بفرستید.
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		noLinks: `❌ هیچ لینک v2ray (vless://  vmess://  trojan://  ss://) در این پیکربندی یافت نشد.
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		linksIntro: `🔗 %d لینک یافت شد. بلوک زیر را کپی کرده و در کلاینت خود (v2rayNG / NekoBox / Shadowrocket) جای‌گذاری کنید:
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		formats: `فرمت‌های پشتیبانی شده:
+• .npvt  NpvTunnel
+• .slip  SlipNet
+• .ehi   HTTP Injector
+• .dark  DarkTunnel
+• .hat   HA Tunnel Plus
+• .nm    NetMod
+• .happ  Happ Proxy
+
+🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		brand:   `🔓 توسط @LimooDecryptorbot رمزگشایی شد`,
+		langSet: `✅ زبان روی %s تنظیم شد.`,
+		langUsage: `زبان را با یکی از دستورات زیر تغییر دهید:
+/lang fa  — فارسی
+/lang en  — English`,
+	},
+	langEN: {
+		help: `*Pantegnos Decryptor Bot* 🔓
+
+Send me an encrypted VPN / proxy config file and I will return the decrypted contents.
+
+*Supported formats:*
+• .npvt  NpvTunnel (NapsternetV)
+• .slip  SlipNet (v1–v28)
+• .ehi   HTTP Injector
+• .dark  DarkTunnel
+• .hat   HA Tunnel Plus
+• .nm    NetMod
+• .happ  Happ Proxy
+
+Just attach the file to a message — no commands needed. After decrypting, pick *Raw* for the full dump or *V2Ray Links* for the importable vless:// vmess:// trojan:// ss:// links.
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		formatChoice: `✅ Decrypted *%s*.
+Choose how you want the output:
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		unsupported: `❌ Unsupported file type.
+
+Supported formats: .npvt  .slip  .ehi  .dark  .hat  .nm  .happ
+Send the config as a document.
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		noDoc: `Send me a VPN config file (.npvt, .slip, .ehi, .dark, .hat, .nm, .happ) as a document and I will decrypt it for you.
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		sessionExpired: `⏳ Session expired — please resend the config file to get fresh options.
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		noLinks: `❌ No v2ray links (vless://  vmess://  trojan://  ss://) found in this config.
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		linksIntro: `🔗 Found %d link(s). Copy the block below and paste it into your client (v2rayNG / NekoBox / Shadowrocket):
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		formats: `Supported formats:
+• .npvt  NpvTunnel
+• .slip  SlipNet
+• .ehi   HTTP Injector
+• .dark  DarkTunnel
+• .hat   HA Tunnel Plus
+• .nm    NetMod
+• .happ  Happ Proxy
+
+🔓 Decrypted by @LimooDecryptorbot`,
+		brand:   `🔓 Decrypted by @LimooDecryptorbot`,
+		langSet: `✅ Language set to %s.`,
+		langUsage: `Change language with:
+/lang fa  — فارسی
+/lang en  — English`,
+	},
+}
+
+func d(l langKey) dict {
+	if l == langEN {
+		return dictionaries[langEN]
+	}
+	return dictionaries[langFA] // default Farsi
+}
+
+func langOf(userID int64) langKey {
+	langMu.Lock()
+	l := userLang[userID]
+	langMu.Unlock()
+	if l == "" {
+		return langFA
+	}
+	return l
+}
+
+func setLang(userID int64, l langKey, explicit bool) {
+	langMu.Lock()
+	userLang[userID] = l
+	if explicit {
+		userLangExplicit[userID] = true
+	}
+	langMu.Unlock()
+}
+
+func setLangFromUser(userID int64, from *tgFrom) {
+	if from == nil {
 		return
 	}
-	intro := fmt.Sprintf("🔗 Found %d link(s). Copy the block below and paste it into your client (v2rayNG / NekoBox / Shadowrocket):\n\n%s",
-		len(links), brandFooter)
-	sendPlain(token, chatID, intro, nil)
-	sendCodeChunks(token, chatID, strings.Join(links, "\n"))
+	langMu.Lock()
+	explicit := userLangExplicit[userID]
+	langMu.Unlock()
+	if explicit {
+		return
+	}
+	lc := strings.ToLower(from.LanguageCode)
+	var l langKey
+	switch {
+	case strings.HasPrefix(lc, "en"):
+		l = langEN
+	case lc == "fa" || strings.HasPrefix(lc, "fa"):
+		l = langFA
+	default:
+		return
+	}
+	langMu.Lock()
+	userLang[userID] = l
+	langMu.Unlock()
 }
 
-// sendFormatChoice shows the colored inline buttons after a file is decrypted.
-func sendFormatChoice(token string, chatID int64, fileName string) {
-	text := fmt.Sprintf("✅ Decrypted *%s*.\nChoose how you want the output:\n\n%s",
-		escapeMarkdown(fileName), brandFooter)
+func handleLang(token string, chatID, userID int64, text string) {
+	arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "/lang")))
+	switch arg {
+	case "fa":
+		setLang(userID, langFA, true)
+		sendPlain(token, chatID, fmt.Sprintf(d(langFA).langSet, "فارسی"), nil)
+	case "en":
+		setLang(userID, langEN, true)
+		sendPlain(token, chatID, fmt.Sprintf(d(langEN).langSet, "English"), nil)
+	default:
+		sendPlain(token, chatID, d(langOf(userID)).langUsage, nil)
+	}
+}
+
+func registerCommands(token string) {
+	for _, sc := range []string{"fa", "en"} {
+		var cmds []tgCommand
+		if sc == "fa" {
+			cmds = []tgCommand{
+				{"/start", "شروع"},
+				{"/help", "راهنما"},
+				{"/lang", "تغییر زبان (fa/en)"},
+				{"/formats", "فرمت‌های پشتیبانی شده"},
+			}
+		} else {
+			cmds = []tgCommand{
+				{"/start", "Start"},
+				{"/help", "Help"},
+				{"/lang", "Set language (fa/en)"},
+				{"/formats", "Supported formats"},
+			}
+		}
+		payload, _ := json.Marshal(map[string]interface{}{
+			"commands":     cmds,
+			"language_code": sc,
+		})
+		resp, err := http.Post("https://api.telegram.org/bot"+token+"/setMyCommands",
+			"application/json", bytes.NewReader(payload))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+}
+
+// ---- sending helpers ----
+
+func sendFormatChoice(token string, chatID, userID int64, fileName string) {
+	l := langOf(userID)
+	text := fmt.Sprintf(d(l).formatChoice, escapeMarkdown(fileName))
 	markup := tgInlineKeyboard{
 		InlineKeyboard: [][]tgInlineBtn{
 			{{Text: "🔵 Raw", CallbackData: "raw", Style: "primary"}},
@@ -253,6 +583,23 @@ func sendFormatChoice(token string, chatID int64, fileName string) {
 		},
 	}
 	sendMarkdown(token, chatID, text, markup)
+}
+
+func sendRaw(token string, chatID, userID int64, raw string) {
+	sendCodeChunks(token, chatID, raw)
+	sendPlain(token, chatID, d(langOf(userID)).brand, nil)
+}
+
+func sendV2rayLinks(token string, chatID, userID int64, raw string) {
+	l := langOf(userID)
+	links := extractV2rayLinks(raw)
+	if len(links) == 0 {
+		sendPlain(token, chatID, d(l).noLinks, nil)
+		return
+	}
+	intro := fmt.Sprintf(d(l).linksIntro, len(links))
+	sendPlain(token, chatID, intro, nil)
+	sendCodeChunks(token, chatID, strings.Join(links, "\n"))
 }
 
 type tgInlineBtn struct {
@@ -380,23 +727,4 @@ func httpGetBytes(u string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
-}
-
-func helpText() string {
-	return `*Pantegnos Decryptor Bot* 🔓
-
-Send me an encrypted VPN / proxy config file and I will return the decrypted contents.
-
-*Supported formats:*
-• .npvt  NpvTunnel (NapsternetV)
-• .slip  SlipNet (v1–v28)
-• .ehi   HTTP Injector
-• .dark  DarkTunnel
-• .hat   HA Tunnel Plus
-• .nm    NetMod
-• .happ  Happ Proxy
-
-Just attach the file to a message — no commands needed. After decrypting, pick *Raw* for the full dump or *V2Ray Links* for the importable vless:// vmess:// trojan:// ss:// links.
-
-` + brandFooter
 }
