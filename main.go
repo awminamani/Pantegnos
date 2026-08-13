@@ -573,7 +573,7 @@ func sendFormatChoice(token string, chatID, userID int64, fileName string) {
 		InlineKeyboard: [][]tgInlineBtn{
 			{{Text: "🔵 Raw", CallbackData: "raw", Style: "primary"}},
 			{{Text: "🟢 V2Ray Links", CallbackData: "links", Style: "success"}},
-			{{Text: "🟡 JSON", CallbackData: "json", Style: "warning"}},
+			{{Text: "🟡 JSON", CallbackData: "json", Style: "danger"}},
 		},
 	}
 	sendMarkdown(token, chatID, text, markup)
@@ -715,7 +715,16 @@ func sendText(token string, chatID int64, text, parseMode string, markup interfa
 			}
 			first = false
 		}
-		_, _ = http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), params)
+		resp, rerr := http.PostForm(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), params)
+		if rerr != nil {
+			log.Printf("sendMessage failed: %v", rerr)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			log.Printf("sendMessage HTTP %d: %s", resp.StatusCode, string(body))
+		}
 	}
 }
 
