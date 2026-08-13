@@ -208,7 +208,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(upd.Message.Text) != "" {
 		text := strings.TrimSpace(upd.Message.Text)
 		switch {
-		case strings.HasPrefix(text, "/lang"):
+		case text == "/lang":
+			sendLangChoice(botToken, chatID, userID)
+			w.WriteHeader(http.StatusOK)
+			return
+		case strings.HasPrefix(text, "/lang "):
 			handleLang(botToken, chatID, userID, text)
 			w.WriteHeader(http.StatusOK)
 			return
